@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GIS Wind Field Simulation - WebGL2</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#04070d; }
+  #glcanvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #hud {
+    position:fixed; top:16px; left:16px; z-index:10; pointer-events:none;
+    padding:12px 18px; border:1px solid rgba(80,160,255,.25); border-radius:10px;
+    background:rgba(6,12,22,.55); -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    color:#cfe8ff; font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif;
+  }
+  #hud h1 { margin:0 0 4px; font-size:17px; font-weight:600; letter-spacing:.5px; color:#7fd0ff; }
+  #hud p { margin:0; font-size:12px; opacity:.75; }
+  #err {
+    display:none; position:fixed; inset:0; z-index:20; padding:40px;
+    background:#04070d; color:#ff8080; font:14px/1.6 monospace; white-space:pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="hud">
+  <h1>GIS Wind Field Simulation - WebGL2</h1>
+  <p id="stats">initializing…</p>
+</div>
+<div id="err"></div>
+<script>
+'use strict';
+/* =====================================================================================
+ * GIS Wind Field Simulation - WebGL2
+ * 本 Demo 的三个核心技术点（代码中均有对应注释）：
+ *  1) 3D Texture：gl.texImage3D 上传风场体数据          -> createWindTexture()
+ *  2) Ping-pong FBO：两张状态纹理 + 两个帧缓冲来回切换   -> stepSimulation()
+ *  3) Shader 内插值 + 流场计算：3D 纹理硬件三线性插值
+ *     + mix() 二次线性插值 + 欧拉积分推进粒子           -> UPDATE_FS
+ * 风场数据为程序生成的平滑随机噪声（流函数旋度 => 无散度流），不接真实气象数据。
+ * ===================================================================================*/
+
+const canvas = document.getElementById('glcanvas');
+const errBox = document.getElementById('err');
+function fail(msg){ errBox.style.display='block'; errBox.textContent = msg; throw new Error(msg); }
+
+/* preserveDrawingBuffer:true 是关键：拖尾效果依赖上一帧的画面残留，
+ * 否则浏览器合成后缓冲区被清空，淡化相位无从衰减 => 只剩当前帧噪点 */
+const gl = canvas.getContext('webgl2', { alpha:false, antialias:false, depth:false, stencil:false,
+                                         preserveDrawingBuffer:true });
+if (!gl) fail('WebGL2 is not supported by this browser.');
+
+/* 浮点渲染目标：粒子位置状态需要高精度纹理。优先 EXT_color_buffer_float，
+ * 退化到 EXT_color_buffer_half_float，都没有则无法做 FBO 粒子模拟。 */
+let stateInternalFormat, stateType;
+if (gl.getExtension('EXT_color_buffer_float')) {
+  stateInternalFormat = gl.RGBA32F; stateType = gl.FLOAT;
+} else if (gl.getExtension('EXT_color_buffer_half_float')) {
+  stateInternalFormat = gl.RGBA16F; stateType = gl.HALF_FLOAT;
+} else fail('Missing EXT_color_buffer_float / half_float: cannot render to float textures.');
+
+/* 粒子状态纹理尺寸：128x128 = 16384 个粒子（每粒子一个纹素，rgba = pos.xy, age, seed） */
+const PARTICLE_W = 128, PARTICLE_H = 128, PARTICLE_COUNT = PARTICLE_W * PARTICLE_H;
+/* 3D 风场体纹理尺寸：128x128 空间分辨率 x 16 层时间切片 */
+const WIND_W = 128, WIND_H = 128, WIND_D = 16;
+
+/* ---------------- Shaders ---------------- */
+
+/* 全屏三角形顶点着色器（更新相位与拖尾淡化相位共用，attributeless 渲染） */
+const QUAD_VS = `#version 300 es
+void main(){
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+/* 【技术点 3a】更新片元着色器：流场计算核心。
+ * 每个纹素保存一个粒子的状态：xy=位置(0..1 uv 空间), z=年龄, w=随机种子。 */
+const UPDATE_FS = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+
+uniform sampler2D uState;   // Ping-pong 的“读”纹理（上一帧粒子状态）
+uniform sampler3D uWind;    // 3D 风场体纹理
+uniform float uTime;        // 秒
+uniform float uDt;          // 帧间隔（已 clamp）
+uniform int   uInit;        // 1 = 初始化写入随机出生点
+
+out vec4 fragState;
+
+/* 无依赖 hash 噪声：用于粒子出生位置与重生随机化 */
+float hash(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+/* 采样风场：texture() 在 LINEAR 过滤下对 3D 纹理做【硬件三线性插值】；
+ * z 轴（体数据深度方向）随时间缓慢推进，相当于在空间插值之外再叠加
+ * 时间维度的插值，让风场形态随时间平滑演变。 */
+vec2 sampleWind(vec2 uv){
+  float z = fract(uTime * 0.02);
+  vec3 w = texture(uWind, vec3(uv, z)).rgb;
+  return w.xy * 2.0 - 1.0;   // [0,1] 编码 -> [-1,1] 风速向量
+}
+
+void main(){
+  ivec2 tc = ivec2(gl_FragCoord.xy);
+
+  if (uInit == 1) {
+    float h1 = hash(vec2(tc) + 0.7);
+    float h2 = hash(vec2(tc) + 31.7);
+    fragState = vec4(h1, h2, h1 * 12.0, h2);   // 随机位置 + 错开的初始年龄
+    return;
+  }
+
+  vec4 st    = texelFetch(uState, tc, 0);
+  vec2 pos   = st.xy;
+  float age  = st.z;
+  float seed = st.w;
+
+  /* ---- 流场计算：两点采样 + mix() 线性插值（中点近似，二阶精度），再欧拉积分 ---- */
+  vec2 v1  = sampleWind(pos);                  // 当前位置风速
+  vec2 v2  = sampleWind(pos + v1 * 0.015);     // 沿风向预估前方一点的风速
+  vec2 vel = mix(v1, v2, 0.5);                 // 线性插值 => 平滑后的中流速度
+  pos += vel * uDt * 0.25;                     // 欧拉积分推进粒子
+  age += uDt;
+
+  /* 粒子老化 / 飞出边界 / 小概率随机 => 重生，维持粒子分布均匀 */
+  float h = hash(pos + seed + fract(uTime));
+  bool dead = age > 5.0 + seed * 8.0
+           || pos.x < 0.0 || pos.x > 1.0 || pos.y < 0.0 || pos.y > 1.0
+           || h < 0.0025;
+  if (dead) {
+    pos = vec2(hash(vec2(seed, uTime)), hash(vec2(uTime, seed)));
+    age = 0.0;
+  }
+
+  fragState = vec4(pos, age, seed);
+}`;
+/* 【技术点 3b】绘制顶点着色器：每个粒子一个顶点（gl_VertexID -> 状态纹素），
+ * 同时再采样一次 3D 风场取得当前风速用于着色（同样的三线性插值）。 */
+const DRAW_VS = `#version 300 es
+precision highp float;
+precision highp sampler3D;
+uniform sampler2D uState;
+uniform sampler3D uWind;
+uniform int   uTexW;
+uniform float uTime;
+uniform float uPointSize;
+out float vSpeed;
+out float vFade;
+void main(){
+  ivec2 tc = ivec2(gl_VertexID % uTexW, gl_VertexID / uTexW);
+  vec4 st  = texelFetch(uState, tc, 0);
+  float z  = fract(uTime * 0.02);
+  vec3 w   = texture(uWind, vec3(st.xy, z)).rgb;   // 3D 纹理三线性插值取风速
+  vSpeed   = length(w.xy * 2.0 - 1.0);
+  vFade    = clamp(st.z * 1.5, 0.0, 1.0);          // 粒子出生时淡入，避免突现
+  gl_Position  = vec4(st.xy * 2.0 - 1.0, 0.0, 1.0);
+  gl_PointSize = uPointSize;
+}`;
+
+/* 绘制片元着色器：GIS 风格速度色带 + 低透明度叠加 => 风的流动拖尾感 */
+const DRAW_FS = `#version 300 es
+precision highp float;
+in float vSpeed;
+in float vFade;
+out vec4 fragColor;
+void main(){
+  vec3 slow = vec3(0.10, 0.25, 0.75);   // 低速：深蓝
+  vec3 mid  = vec3(0.15, 0.75, 0.95);   // 中速：青
+  vec3 fast = vec3(0.95, 1.00, 1.00);   // 高速：亮白
+  float t = clamp(vSpeed * 1.3, 0.0, 1.0);
+  vec3 col = t < 0.5 ? mix(slow, mid, t * 2.0) : mix(mid, fast, (t - 0.5) * 2.0);
+  float a = 0.35 * vFade;
+  fragColor = vec4(col * a, a);          // 预乘输出，配合 gl.ONE 加法混合叠亮
+}`;
+
+/* 淡化片元着色器：每帧先盖一层低透明度背景色，形成运动拖尾 */
+const FADE_FS = `#version 300 es
+precision highp float;
+uniform vec3  uBg;
+uniform float uAlpha;
+out vec4 fragColor;
+void main(){ fragColor = vec4(uBg, uAlpha); }`;
+
+/* ---------------- GL 工具函数 ---------------- */
+
+function compileShader(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    fail('Shader compile error:\n' + gl.getShaderInfoLog(s) + '\n--- source ---\n' + src);
+  return s;
+}
+function linkProgram(vsSrc, fsSrc){
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    fail('Program link error:\n' + gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* ---------------- 风场体数据生成（纯程序噪声，不接真实气象数据） ----------------
+ * 思路：生成随机标量场 psi（流函数），盒式模糊成平滑噪声，
+ * 再取旋度 u = dψ/dy, v = -dψ/dx 得到无散度风场（curl noise），
+ * 这样粒子会沿流线打转，视觉上接近真实风的涡旋结构。 */
+function buildWindData(){
+  const N = WIND_W * WIND_H * WIND_D;
+  let psi = new Float32Array(N);
+  for (let i = 0; i < N; i++) psi[i] = Math.random();          // 白噪声
+  const wrap = (v, m) => (v + m) % m;
+  const idx  = (x, y, z) => (z * WIND_H + y) * WIND_W + wrap(x, WIND_W);
+  for (let pass = 0; pass < 4; pass++){                        // 4 次 3x3 盒式模糊 => 平滑
+    const src = psi.slice();
+    for (let z = 0; z < WIND_D; z++)
+      for (let y = 0; y < WIND_H; y++)
+        for (let x = 0; x < WIND_W; x++){
+          let s = 0;
+          for (let dy = -1; dy <= 1; dy++){
+            const yy = wrap(y + dy, WIND_H);
+            for (let dx = -1; dx <= 1; dx++)
+              s += src[(z * WIND_H + yy) * WIND_W + wrap(x + dx, WIND_W)];
+          }
+          psi[(z * WIND_H + y) * WIND_W + x] = s / 9;
+        }
+  }
+  const vec  = new Float32Array(N * 2);
+  let maxV = 1e-6;
+  for (let z = 0; z < WIND_D; z++)
+    for (let y = 0; y < WIND_H; y++)
+      for (let x = 0; x < WIND_W; x++){
+        const u = psi[idx(x, wrap(y + 1, WIND_H), z)] - psi[idx(x, wrap(y - 1, WIND_H), z)];
+        const v = -(psi[idx(wrap(x + 1, WIND_W), y, z)] - psi[idx(wrap(x - 1, WIND_W), y, z)]);
+        vec[((z * WIND_H + y) * WIND_W + x) * 2]     = u;
+        vec[((z * WIND_H + y) * WIND_W + x) * 2 + 1] = v;
+        maxV = Math.max(maxV, Math.hypot(u, v));
+      }
+  const data = new Uint8Array(N * 4);
+  for (let i = 0; i < N; i++){
+    const u = vec[i * 2] / maxV, v = vec[i * 2 + 1] / maxV;
+    data[i * 4]     = Math.round((u * 0.5 + 0.5) * 255);       // R: u 编码到 [0,1]
+    data[i * 4 + 1] = Math.round((v * 0.5 + 0.5) * 255);       // G: v 编码到 [0,1]
+    data[i * 4 + 2] = Math.round(Math.min(1, Math.hypot(u, v)) * 255); // B: 风速大小
+    data[i * 4 + 3] = 255;
+  }
+  return data;
+}
+/* ---------------- 3D 风场纹理 ---------------- */
+function createWindTexture(){
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, tex);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); // LINEAR => 硬件三线性插值
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.REPEAT);      // 深度(时间)轴循环
+  /* ===== 技术点 1：gl.texImage3D 上传 3D Texture（风场体数据） ===== */
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, WIND_W, WIND_H, WIND_D, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, buildWindData());
+  return tex;
+}
+
+/* ---------------- Ping-pong 状态纹理 + FBO ---------------- */
+function createStateTarget(){
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, stateInternalFormat, PARTICLE_W, PARTICLE_H, 0,
+                gl.RGBA, stateType, null);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+    fail('Framebuffer incomplete: float render target not supported.');
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo };
+}
+
+/* ---------------- 组装 ---------------- */
+const progUpdate = linkProgram(QUAD_VS, UPDATE_FS);
+const progDraw   = linkProgram(DRAW_VS, DRAW_FS);
+const progFade   = linkProgram(QUAD_VS, FADE_FS);
+const U = (p, n) => gl.getUniformLocation(p, n);
+const uUpd = { state:U(progUpdate,'uState'), wind:U(progUpdate,'uWind'),
+               time:U(progUpdate,'uTime'), dt:U(progUpdate,'uDt'), init:U(progUpdate,'uInit') };
+const uDrw = { state:U(progDraw,'uState'), wind:U(progDraw,'uWind'),
+               texW:U(progDraw,'uTexW'), time:U(progDraw,'uTime'), psize:U(progDraw,'uPointSize') };
+const uFad = { bg:U(progFade,'uBg'), alpha:U(progFade,'uAlpha') };
+
+const windTex  = createWindTexture();
+const targets  = [createStateTarget(), createStateTarget()];   // Ping-pong 双缓冲
+let   cur      = 0;                                            // 当前“读”下标
+const maxPt    = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE)[1] || 1;
+const BG = [0.012, 0.02, 0.045];                               // 暗色背景
+
+/* 初始化：用 uInit=1 跑两轮更新，让两张状态纹理都写入合法的随机出生点 */
+function runUpdate(time, dt, init){
+  const read = targets[cur], write = targets[1 - cur];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, write.fbo);
+  gl.viewport(0, 0, PARTICLE_W, PARTICLE_H);
+  gl.useProgram(progUpdate);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, read.tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, windTex);
+  gl.uniform1i(uUpd.state, 0); gl.uniform1i(uUpd.wind, 1);
+  gl.uniform1f(uUpd.time, time); gl.uniform1f(uUpd.dt, dt);
+  gl.uniform1i(uUpd.init, init);
+  gl.disable(gl.BLEND);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  cur = 1 - cur;                                               // ===== 技术点 2：交换读写缓冲 =====
+}
+runUpdate(0, 0.016, 1);
+runUpdate(0, 0.016, 1);
+
+/* ---------------- 主循环 ---------------- */
+let lastT = performance.now();
+let frames = 0, fpsT = lastT;
+const statsEl = document.getElementById('stats');
+
+function stepSimulation(now){
+  const time = now / 1000;
+  const dt = Math.min(0.033, Math.max(0.001, (now - lastT) / 1000));
+  lastT = now;
+
+  /* ===== 技术点 2：Ping-pong FBO —— 绑定“写”FBO、采样“读”纹理，跑完交换 ===== */
+  runUpdate(time, dt, 0);
+
+  /* --- 渲染到屏幕 --- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+
+  /* 1) 淡化相位：低透明度背景色盖全屏，旧帧逐渐消退 => 风的拖尾 */
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progFade);
+  gl.uniform3f(uFad.bg, BG[0], BG[1], BG[2]);
+  gl.uniform1f(uFad.alpha, 0.075);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  /* 2) 粒子相位：加法混合叠加亮点 */
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(progDraw);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, targets[cur].tex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, windTex);
+  gl.uniform1i(uDrw.state, 0); gl.uniform1i(uDrw.wind, 1);
+  gl.uniform1i(uDrw.texW, PARTICLE_W);
+  gl.uniform1f(uDrw.time, time);
+  gl.uniform1f(uDrw.psize, Math.min(2.0, maxPt));
+  gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+  gl.disable(gl.BLEND);
+
+  /* FPS 统计 */
+  frames++;
+  if (now - fpsT >= 500){
+    const fps = Math.round(frames * 1000 / (now - fpsT));
+    frames = 0; fpsT = now;
+    statsEl.textContent =
+      PARTICLE_COUNT.toLocaleString() + ' particles · WebGL2 · ' + fps +
+      ' FPS · curl-noise wind field (3D texture)';
+  }
+  requestAnimationFrame(stepSimulation);
+}
+
+/* ---------------- 自适应尺寸 ---------------- */
+function resize(){
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width  = Math.round(canvas.clientWidth  * dpr);
+  canvas.height = Math.round(canvas.clientHeight * dpr);
+}
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(stepSimulation);
+</script>
+</body>
+</html>
